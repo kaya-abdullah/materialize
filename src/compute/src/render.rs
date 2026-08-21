@@ -743,6 +743,12 @@ impl<'g> Context<'g, mz_repr::Timestamp> {
                     errs.stream = errs.stream.log_dataflow_errors(logger, idx_id);
                 }
 
+                // Borrows the arrangements, so it must precede moving their traces into the
+                // `TraceBundle` below.
+                if compute_state.role().publishes() {
+                    compute_state.sharing_registry.publish(idx_id, &oks, &errs);
+                }
+
                 compute_state.traces.set(
                     idx_id,
                     TraceBundle::new(oks.trace, errs.trace).with_drop(needed_tokens),
@@ -752,6 +758,20 @@ impl<'g> Context<'g, mz_repr::Timestamp> {
                 // Duplicate of existing arrangement with id `gid`, so
                 // just create another handle to that arrangement.
                 let trace = compute_state.traces.get(&gid).unwrap().clone();
+                // Published as its own point rather than under `gid`'s, see
+                // `ArrangementSharingRegistry::publish`. This arm has no arrangement streams of
+                // its own, so the publishers attach to a re-import of the shared traces.
+                if compute_state.role().publishes() {
+                    let (oks, mut errs) =
+                        trace.import_named(self.scope.clone(), &format!("Publish({idx_id})"));
+                    // The import gives this dataflow operators, and `mz_compute_error_counts`
+                    // forwards a dependency's counts only to a re-export whose dataflow has
+                    // none, so the re-export logs its own counts from the imported errors.
+                    if let Some(logger) = compute_state.compute_logger.clone() {
+                        errs.stream = errs.stream.log_dataflow_errors(logger, idx_id);
+                    }
+                    compute_state.sharing_registry.publish(idx_id, &oks, &errs);
+                }
                 compute_state.traces.set(idx_id, trace);
             }
             None => {
@@ -845,6 +865,12 @@ where
                     errs.stream = errs.stream.log_dataflow_errors(logger, idx_id);
                 }
 
+                // Borrows the arrangements, so it must precede moving their traces into the
+                // `TraceBundle` below.
+                if compute_state.role().publishes() {
+                    compute_state.sharing_registry.publish(idx_id, &oks, &errs);
+                }
+
                 compute_state.traces.set(
                     idx_id,
                     TraceBundle::new(oks.trace, errs.trace).with_drop(needed_tokens),
@@ -854,6 +880,15 @@ where
                 // Duplicate of existing arrangement with id `gid`, so
                 // just create another handle to that arrangement.
                 let trace = compute_state.traces.get(&gid).unwrap().clone();
+                // See the unbucketed export path above.
+                if compute_state.role().publishes() {
+                    let (oks, mut errs) =
+                        trace.import_named(outer.clone(), &format!("Publish({idx_id})"));
+                    if let Some(logger) = compute_state.compute_logger.clone() {
+                        errs.stream = errs.stream.log_dataflow_errors(logger, idx_id);
+                    }
+                    compute_state.sharing_registry.publish(idx_id, &oks, &errs);
+                }
                 compute_state.traces.set(idx_id, trace);
             }
             None => {
