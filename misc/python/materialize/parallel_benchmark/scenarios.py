@@ -10,6 +10,7 @@
 import queue
 import time
 from copy import deepcopy
+from dataclasses import replace
 
 import psycopg
 
@@ -1528,6 +1529,10 @@ class PeekIsolationUnderExpensivePeeks(Scenario):
     size and the peek response stash out of the measurement. The cheap query is
     a literal lookup on the key, and its p99 is what this reports.
 
+    Both queries are peeks, so they share a runtime wherever peeks are placed.
+    This guards how the runtime that serves peeks interleaves a cheap one with
+    an expensive one, not the split between peeks and maintenance.
+
     Three things the numbers depend on, none of which the output would reveal if
     they stopped holding:
 
@@ -1535,9 +1540,10 @@ class PeekIsolationUnderExpensivePeeks(Scenario):
       lookups queue without bound and the percentiles report the length of the
       load phase. The measured cluster is one worker, since `Materialized` boots
       at the `bootstrap` replica size and `--size` does not reach it, so the rate
-      is set against one walk: at 100ns to 1us per position, 100,000 positions
-      is 10ms to 100ms, and 2/s of those is 2% to 20% of that worker. Raising
-      the rate or the row count means redoing this.
+      is set against one walk: 100,000 positions measured about 40ms, so 500,000
+      is about 200ms, and 3/s of those is about 60% of that worker. At 100,000
+      positions and 2/s the lookups did not notice the walks at all. Raising the
+      rate or the row count means redoing this.
     * The loops are pooled and the pool is far larger than the ~3 connections
       they hold. Waiting for a connection is timed like waiting for the replica,
       and `ReuseConnQuery` would cap concurrency at one and report a client-side
@@ -1571,7 +1577,7 @@ class PeekIsolationUnderExpensivePeeks(Scenario):
                     # queued behind it and short enough to leave the worker idle
                     # between walks. The class docstring has the arithmetic.
                     > CREATE TABLE hot (k int, v int)
-                    > INSERT INTO hot SELECT n, n * 2 FROM generate_series(1, 100000) AS n
+                    > INSERT INTO hot SELECT n, n * 2 FROM generate_series(1, 500000) AS n
                     > CREATE INDEX hot_k ON hot (k)
 
                     # Wait for the index to hydrate before measuring.
@@ -1593,7 +1599,7 @@ class PeekIsolationUnderExpensivePeeks(Scenario):
                         # nothing and every position is examined for no rows.
                         OpenLoop(
                             action=PooledQuery("SELECT v FROM hot WHERE v = -1"),
-                            dist=Periodic(per_second=2),
+                            dist=Periodic(per_second=3),
                             report_regressions=False,
                         ),
                     ],
@@ -1740,10 +1746,9 @@ class FreshnessUnderPeekWalks(Scenario):
     connection; the contention is a fixed rate of full index walks on the same
     replica.
 
-    The walk table is sized as in `PeekIsolationUnderExpensivePeeks`: each walk
-    is long enough to hold the frontier back measurably and short enough to
-    leave the worker idle between walks, so the read does not queue without
-    bound.
+    The walk table is 100,000 rows at 2/s, about 40ms per walk on one worker,
+    so each walk holds the frontier back measurably while leaving the worker
+    idle between walks and the read does not queue without bound.
     """
 
     def __init__(self, c: Composition, conn_infos: dict[str, PgConnInfo]):
@@ -1808,5 +1813,107 @@ class FreshnessUnderPeekWalks(Scenario):
             conn_pool_setup=["SET TRANSACTION_ISOLATION TO 'SERIALIZABLE'"],
             regression_thresholds={
                 "SELECT count(*) FROM fresh_w WHERE k = 0 (reuse connection)": CONTENDED_THRESHOLDS,
+            },
+        )
+
+
+class MaintenanceUnderPeekSaturation(Scenario):
+    """Measures how far a saturating peek load holds back the maintenance of a
+    written index.
+
+    The other isolation scenarios saturate maintenance and measure peeks. This
+    is the converse: enough concurrent peek dataflows to keep every worker that
+    serves them busy, and the measured query is a strict serializable read of a
+    small index that a writer keeps advancing. The read cannot answer until the
+    index's frontier on the replica passes the write, so its latency is the
+    frontier lag plus one lookup.
+
+    The replica has eight workers, half the cores of the agents the nightly runs
+    on. With a second runtime the two sets of worker threads fill the machine,
+    which is the oversubscription this prices. With one runtime the eight
+    workers serve the peeks and maintain the index in turn.
+
+    The peek is a self join of a 200,000-row indexed table, so each one imports
+    a shared arrangement and does real work. Eight closed loops keep one in
+    flight per worker. Their latency is reported too: it is the throughput of
+    the runtime that serves them, and a regression there is a peek regression
+    even if the read stays fresh.
+    """
+
+    def __init__(self, c: Composition, conn_infos: dict[str, PgConnInfo]):
+        # `connect()` issues `SET cluster` itself, which has to run in autocommit:
+        # `ReuseConnQuery` turns autocommit on afterwards and cannot while that
+        # statement's transaction is open. The cluster does not exist yet when
+        # these connections open, which is a notice, not an error.
+        mz = replace(conn_infos["materialized"], cluster="sat", autocommit=True)
+        join = "SELECT count(*) FROM sat_big a JOIN sat_big b USING (k)"
+        self.init(
+            [
+                TdPhase(f"""
+                    > DROP TABLE IF EXISTS sat_w CASCADE
+                    > DROP TABLE IF EXISTS sat_big CASCADE
+                    > DROP CLUSTER IF EXISTS sat CASCADE
+
+                    > CREATE CLUSTER sat SIZE 'scale=1,workers=8', REPLICATION FACTOR 1
+                    > SET cluster = sat
+
+                    # The written index, whose frontier the read waits for.
+                    > CREATE TABLE sat_w (k int, v int)
+                    > INSERT INTO sat_w SELECT n, n FROM generate_series(1, 1000) AS n
+                    > CREATE INDEX sat_w_k IN CLUSTER sat ON sat_w (k)
+
+                    # The join input.
+                    > CREATE TABLE sat_big (k int, v int)
+                    > INSERT INTO sat_big SELECT n, n * 2 FROM generate_series(1, 200000) AS n
+                    > CREATE INDEX sat_big_k IN CLUSTER sat ON sat_big (k)
+
+                    > SELECT count(*) FROM sat_w
+                    1000
+                    > {join}
+                    200000
+                    """),
+                LoadPhase(
+                    duration=120,
+                    actions=[
+                        # Contention: writes the read has to wait for.
+                        ClosedLoop(
+                            action=ReuseConnQuery(
+                                "INSERT INTO sat_w VALUES (0, 0)",
+                                mz,
+                                strict_serializable=False,
+                            ),
+                            report_regressions=False,
+                        ),
+                        # Measured: a read that waits for the index frontier to
+                        # pass the latest write.
+                        ClosedLoop(
+                            action=ReuseConnQuery(
+                                "SELECT count(*) FROM sat_w WHERE k = 0",
+                                mz,
+                                strict_serializable=True,
+                            ),
+                        ),
+                    ]
+                    + [
+                        # Contention and measured: one peek dataflow in flight
+                        # per worker.
+                        ClosedLoop(action=PooledQuery(join))
+                        for _ in range(8)
+                    ],
+                ),
+                TdPhase("""
+                    > DROP TABLE IF EXISTS sat_w CASCADE
+                    > DROP TABLE IF EXISTS sat_big CASCADE
+                    > DROP CLUSTER IF EXISTS sat CASCADE
+                    """),
+            ],
+            conn_pool_size=100,
+            conn_pool_setup=[
+                "SET TRANSACTION_ISOLATION TO 'SERIALIZABLE'",
+                "SET cluster = sat",
+            ],
+            regression_thresholds={
+                "SELECT count(*) FROM sat_w WHERE k = 0 (reuse connection)": CONTENDED_THRESHOLDS,
+                f"{join} (pooled)": CONTENDED_THRESHOLDS,
             },
         )
